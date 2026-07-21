@@ -88,5 +88,69 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Lumie server running on http://localhost:${PORT}`);
 });
+// ── In-memory bridge message store ───────────────────────────────────────────
+// Note: This resets on server restart. For production, use a database.
+const bridgeRooms = {};
 
+// Get messages for a room
+app.get("/api/bridge/:roomCode", (req, res) => {
+  const { roomCode } = req.params;
+  const messages = bridgeRooms[roomCode] || [];
+  res.json({ messages });
+});
+
+// Post a message to a room
+app.post("/api/bridge", async (req, res) => {
+  try {
+    const { roomCode, sender, role, content } = req.body;
+    if (!roomCode || !content) {
+      return res.status(400).json({ error: "roomCode and content are required" });
+    }
+
+    if (!bridgeRooms[roomCode]) {
+      bridgeRooms[roomCode] = [];
+    }
+
+    const userMessage = {
+      id: Date.now().toString(),
+      sender,
+      role,
+      content,
+      timestamp: new Date().toISOString(),
+    };
+
+    bridgeRooms[roomCode].push(userMessage);
+
+    // Get Lumie to respond
+    const systemPrompt = `You are Lumie, a compassionate mediator helping a teen and parent communicate better. 
+A message was just sent in their Family Bridge by ${sender} (${role}).
+Your job is to:
+1. Acknowledge the message warmly
+2. Gently reflect the feeling back in a way both parties can understand
+3. Optionally suggest a question the other person could ask to better understand
+
+Keep it short (2-4 sentences). Be warm and bridge-building.`;
+
+    const response = await anthropic.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 512,
+      messages: [{ role: "user", content: `${systemPrompt}\n\nMessage: "${content}"` }],
+    });
+
+    const lumieReply = {
+      id: (Date.now() + 1).toString(),
+      sender: "Lumie",
+      role: "assistant",
+      content: response.content[0]?.text ?? "",
+      timestamp: new Date().toISOString(),
+    };
+
+    bridgeRooms[roomCode].push(lumieReply);
+
+    res.json({ userMessage, lumieMessage: lumieReply });
+  } catch (err) {
+    console.error("Bridge error:", err);
+    res.status(500).json({ error: "Something went wrong." });
+  }
+});
 module.exports = app;
