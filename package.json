@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.52.0",
+    "@neondatabase/serverless": "^0.10.4",
     "cors": "^2.8.5",
     "dotenv": "^17.4.2",
     "express": "^4.19.2"

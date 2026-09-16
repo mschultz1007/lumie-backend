@@ -2,6 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
 const Anthropic = require("@anthropic-ai/sdk");
+const { neon } = require("@neondatabase/serverless");
 
 const app = express();
 
@@ -19,6 +20,15 @@ app.use(
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY, // set this in Vercel's environment variables
 });
+
+// ── Database ──────────────────────────────────────────────────────────────────
+// DATABASE_URL must be set in Vercel's environment variables (your Neon connection string).
+const sql = neon(process.env.DATABASE_URL);
+
+// ── Limits ────────────────────────────────────────────────────────────────────
+const MAX_HISTORY_MESSAGES = 20; // how many recent messages get sent to Claude, regardless of full history length
+const FREE_DAILY_LIMIT = 30; // free-tier companion messages per day
+const WARNING_THRESHOLD = 24; // show a "running low" warning at this count
 
 // ── System prompt for Lumie ───────────────────────────────────────────────────
 const LUMIE_SYSTEM_PROMPT = `You are Lumie, a warm and supportive mental health companion for teenagers (ages 13–19).
@@ -39,6 +49,51 @@ Important safety rules you MUST always follow:
 
 Tone: Warm, calm, non-judgmental, age-appropriate. Avoid clinical jargon. Use short paragraphs.`;
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Ensures a user row exists, resets their daily count if it's a new day,
+// and returns their current usage/entitlement state.
+async function getOrResetUser(userId) {
+  await sql`
+    INSERT INTO users (id) VALUES (${userId})
+    ON CONFLICT (id) DO NOTHING
+  `;
+
+  const rows = await sql`
+    SELECT daily_message_count, count_reset_date, is_pro, is_family_pro
+    FROM users
+    WHERE id = ${userId}
+  `;
+  let user = rows[0];
+
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD (UTC)
+  const resetDate =
+    user.count_reset_date instanceof Date
+      ? user.count_reset_date.toISOString().slice(0, 10)
+      : String(user.count_reset_date);
+
+  if (resetDate !== today) {
+    await sql`
+      UPDATE users
+      SET daily_message_count = 0, count_reset_date = ${today}
+      WHERE id = ${userId}
+    `;
+    user = { ...user, daily_message_count: 0, count_reset_date: today };
+  }
+
+  return user;
+}
+
+async function incrementUserCount(userId) {
+  const rows = await sql`
+    UPDATE users
+    SET daily_message_count = daily_message_count + 1
+    WHERE id = ${userId}
+    RETURNING daily_message_count
+  `;
+  return rows[0].daily_message_count;
+}
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 // Health check — lets you confirm the server is running
@@ -46,14 +101,56 @@ app.get("/", (req, res) => {
   res.json({ status: "ok", message: "Lumie API is running 🌙" });
 });
 
+// Lets the app check usage/entitlement without sending a chat message
+// (used to show the "X messages left today" warning proactively).
+app.get("/api/usage/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!userId) return res.status(400).json({ error: "userId is required" });
+
+    const user = await getOrResetUser(userId);
+    const isPro = user.is_pro || user.is_family_pro;
+    const remaining = isPro ? null : Math.max(0, FREE_DAILY_LIMIT - user.daily_message_count);
+
+    res.json({
+      dailyCount: user.daily_message_count,
+      limit: isPro ? null : FREE_DAILY_LIMIT,
+      remaining,
+      isPro: user.is_pro,
+      isFamilyPro: user.is_family_pro,
+      warning: !isPro && user.daily_message_count >= WARNING_THRESHOLD,
+    });
+  } catch (err) {
+    console.error("Usage check error:", err);
+    res.status(500).json({ error: "Something went wrong. Please try again." });
+  }
+});
+
 // Main chat endpoint — called by your React Native app
 app.post("/api/chat", async (req, res) => {
   try {
-    const { messages } = req.body;
+    const { userId, messages } = req.body;
+
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
 
     // Basic validation
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: "messages array is required" });
+    }
+
+    const user = await getOrResetUser(userId);
+    const isPro = user.is_pro || user.is_family_pro;
+
+    // Enforce the free daily cap BEFORE calling Claude.
+    if (!isPro && user.daily_message_count >= FREE_DAILY_LIMIT) {
+      return res.status(403).json({
+        error: "daily_limit_reached",
+        message: "You've reached today's chat limit. Crisis resources are always available.",
+        dailyCount: user.daily_message_count,
+        limit: FREE_DAILY_LIMIT,
+      });
     }
 
     // Only allow user/assistant roles and string content (keep it simple & safe)
@@ -65,16 +162,30 @@ app.post("/api/chat", async (req, res) => {
       return res.status(400).json({ error: "No valid messages provided" });
     }
 
+    // Cap how much history gets sent to Claude, no matter how long the
+    // conversation has grown client-side. This is what stops per-request
+    // token cost from growing unbounded over a long session.
+    const trimmed = sanitized.slice(-MAX_HISTORY_MESSAGES);
+
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 1024,
       system: LUMIE_SYSTEM_PROMPT,
-      messages: sanitized,
+      messages: trimmed,
     });
 
     const reply = response.content[0]?.text ?? "";
 
-    res.json({ reply });
+    const newCount = await incrementUserCount(userId);
+
+    res.json({
+      reply,
+      dailyCount: newCount,
+      limit: isPro ? null : FREE_DAILY_LIMIT,
+      remaining: isPro ? null : Math.max(0, FREE_DAILY_LIMIT - newCount),
+      isPro,
+      warning: !isPro && newCount >= WARNING_THRESHOLD,
+    });
   } catch (err) {
     console.error("Anthropic API error:", err);
 
@@ -83,20 +194,23 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-// ── Start server (only used locally — Vercel handles this in prod) ─────────────
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Lumie server running on http://localhost:${PORT}`);
-});
-// ── In-memory bridge message store ───────────────────────────────────────────
-// Note: This resets on server restart. For production, use a database.
-const bridgeRooms = {};
+// ── Family Bridge (now persisted in Postgres, not in-memory) ──────────────────
 
 // Get messages for a room
-app.get("/api/bridge/:roomCode", (req, res) => {
-  const { roomCode } = req.params;
-  const messages = bridgeRooms[roomCode] || [];
-  res.json({ messages });
+app.get("/api/bridge/:roomCode", async (req, res) => {
+  try {
+    const { roomCode } = req.params;
+    const messages = await sql`
+      SELECT id, sender, role, content, created_at AS timestamp
+      FROM bridge_messages
+      WHERE room_code = ${roomCode}
+      ORDER BY created_at ASC
+    `;
+    res.json({ messages });
+  } catch (err) {
+    console.error("Bridge fetch error:", err);
+    res.status(500).json({ error: "Something went wrong." });
+  }
 });
 
 // Post a message to a room
@@ -107,19 +221,16 @@ app.post("/api/bridge", async (req, res) => {
       return res.status(400).json({ error: "roomCode and content are required" });
     }
 
-    if (!bridgeRooms[roomCode]) {
-      bridgeRooms[roomCode] = [];
-    }
+    await sql`
+      INSERT INTO bridge_rooms (room_code) VALUES (${roomCode})
+      ON CONFLICT (room_code) DO NOTHING
+    `;
 
-    const userMessage = {
-      id: Date.now().toString(),
-      sender,
-      role,
-      content,
-      timestamp: new Date().toISOString(),
-    };
-
-    bridgeRooms[roomCode].push(userMessage);
+    const [userMessage] = await sql`
+      INSERT INTO bridge_messages (room_code, sender, role, content)
+      VALUES (${roomCode}, ${sender}, ${role}, ${content})
+      RETURNING id, sender, role, content, created_at AS timestamp
+    `;
 
     // Get Lumie to respond
     const systemPrompt = `You are Lumie, a compassionate mediator helping a teen and parent communicate better. 
@@ -137,20 +248,23 @@ Keep it short (2-4 sentences). Be warm and bridge-building.`;
       messages: [{ role: "user", content: `${systemPrompt}\n\nMessage: "${content}"` }],
     });
 
-    const lumieReply = {
-      id: (Date.now() + 1).toString(),
-      sender: "Lumie",
-      role: "assistant",
-      content: response.content[0]?.text ?? "",
-      timestamp: new Date().toISOString(),
-    };
+    const [lumieMessage] = await sql`
+      INSERT INTO bridge_messages (room_code, sender, role, content)
+      VALUES (${roomCode}, 'Lumie', 'assistant', ${response.content[0]?.text ?? ""})
+      RETURNING id, sender, role, content, created_at AS timestamp
+    `;
 
-    bridgeRooms[roomCode].push(lumieReply);
-
-    res.json({ userMessage, lumieMessage: lumieReply });
+    res.json({ userMessage, lumieMessage });
   } catch (err) {
     console.error("Bridge error:", err);
     res.status(500).json({ error: "Something went wrong." });
   }
 });
+
+// ── Start server (only used locally — Vercel handles this in prod) ─────────────
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Lumie server running on http://localhost:${PORT}`);
+});
+
 module.exports = app;
