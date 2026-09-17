@@ -276,6 +276,7 @@ const ENTITLEMENT_TO_COLUMN = {
 // Event types that mean "this entitlement is now active"
 const ACTIVATING_EVENTS = new Set([
   "INITIAL_PURCHASE",
+  "NON_RENEWING_PURCHASE", // one-time purchases (like Lumie Pro's current $4.99 unlock) use this, not INITIAL_PURCHASE
   "RENEWAL",
   "PRODUCT_CHANGE",
   "UNCANCELLATION",
