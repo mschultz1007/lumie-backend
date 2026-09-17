@@ -260,7 +260,87 @@ Keep it short (2-4 sentences). Be warm and bridge-building.`;
     res.status(500).json({ error: "Something went wrong." });
   }
 });
+// ── RevenueCat webhook ──────────────────────────────────────────────────────
+// Configure this URL + a shared secret in the RevenueCat dashboard
+// (Project Settings → Integrations → Webhooks). RevenueCat sends the secret
+// back as "Authorization: Bearer <secret>" on every request, which we verify
+// below so nobody else can call this and grant themselves Pro for free.
+//
+// Entitlement identifiers must match exactly what's configured in RevenueCat.
+// "Lumie Pro" = teen tier. "Lumie Family" = parent tier (once it exists).
+const ENTITLEMENT_TO_COLUMN = {
+  "Lumie Pro": "is_pro",
+  "Lumie Family": "is_family_pro",
+};
 
+// Event types that mean "this entitlement is now active"
+const ACTIVATING_EVENTS = new Set([
+  "INITIAL_PURCHASE",
+  "RENEWAL",
+  "PRODUCT_CHANGE",
+  "UNCANCELLATION",
+  "SUBSCRIPTION_EXTENDED",
+]);
+
+// Event types that mean "this entitlement is no longer active"
+// (CANCELLATION alone just means auto-renew was turned off — the entitlement
+// stays active until EXPIRATION actually fires, so we don't deactivate on it.)
+const DEACTIVATING_EVENTS = new Set(["EXPIRATION"]);
+
+app.post("/api/webhooks/revenuecat", async (req, res) => {
+  try {
+    const authHeader = req.headers["authorization"] || "";
+    const expected = `Bearer ${process.env.REVENUECAT_WEBHOOK_SECRET}`;
+
+    if (!process.env.REVENUECAT_WEBHOOK_SECRET || authHeader !== expected) {
+      console.error("RevenueCat webhook: invalid or missing auth header");
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    const event = req.body?.event;
+    if (!event || !event.app_user_id || !event.type) {
+      return res.status(400).json({ error: "Malformed event payload" });
+    }
+
+    const userId = event.app_user_id;
+    const entitlementIds = event.entitlement_ids || [];
+
+    // Figure out which of our columns (if any) this event affects
+    const affectedColumns = entitlementIds
+      .map((id) => ENTITLEMENT_TO_COLUMN[id])
+      .filter(Boolean);
+
+    if (affectedColumns.length === 0) {
+      // Event doesn't touch an entitlement we track — acknowledge and ignore
+      return res.json({ received: true, ignored: true });
+    }
+
+    let newValue = null;
+    if (ACTIVATING_EVENTS.has(event.type)) newValue = true;
+    else if (DEACTIVATING_EVENTS.has(event.type)) newValue = false;
+    else {
+      // Event type we don't act on (e.g. BILLING_ISSUE, TRANSFER) — just acknowledge
+      return res.json({ received: true, ignored: true });
+    }
+
+    // Ensure the user row exists, then update the relevant column(s)
+    await sql`INSERT INTO users (id) VALUES (${userId}) ON CONFLICT (id) DO NOTHING`;
+
+    for (const column of affectedColumns) {
+      if (column === "is_pro") {
+        await sql`UPDATE users SET is_pro = ${newValue} WHERE id = ${userId}`;
+      } else if (column === "is_family_pro") {
+        await sql`UPDATE users SET is_family_pro = ${newValue} WHERE id = ${userId}`;
+      }
+    }
+
+    console.log(`RevenueCat webhook: ${event.type} for ${userId} → ${affectedColumns.join(", ")} = ${newValue}`);
+    res.json({ received: true });
+  } catch (err) {
+    console.error("RevenueCat webhook error:", err);
+    res.status(500).json({ error: "Something went wrong." });
+  }
+});
 // ── Start server (only used locally — Vercel handles this in prod) ─────────────
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
